@@ -1,0 +1,473 @@
+## Dissecting the Clonal Origins of Childhood Acute Lymphoblastic Leukemia By Single-Cell Genomics
+
+The aim of this git repository is to provide an overview of the analysis published in the above titled paper in [PNAS](http://www.pnas.org). This analysis is only made possible by the hard work of all the other authors that generated the R packages listed below. Special thanks to authors of `flexmix` , `adegenet` & `FactoMineR` which drives most of the analysis pipeline and `ggplot2` , `heatplus` & `igraph` which drives all of the visualizations. The complete analysis framework, biological concept and applications  are greatly inspired by my advisor: [Stephen Quake](http://thebigone.stanford.edu/) and dear friend, Dr Charles Gawad.
+
+###Key features:
+
+* Finite Mixture Model based clusering of binary matrix of mutations using the `flexmix` package
+* Using different information criterion for determing the number of clones 
+* Inference of allele dropout rate from the model based clustering results
+* Ploting functions for visualization of the clonal mutation profile using `ggplot2` package
+* Heatmap visualizations with clonal annotations using `heatplus` package
+* Multiple Correspondence analysis as an unsupervised method of infering clones from binary mutations matrix using `FactoMineR` package
+* Generation of clonal tree using the `adegenet` and `igraph` package
+
+### Required R packages for the analysis
+```{r, message=FALSE }
+require(flexmix)          # For model based clustering
+require(RColorBrewer)     # For color palettes in plotting
+require(ggplot2)          # For plotting
+require(FactoMineR)       # For performing MCA
+require(vegan)            # For calculating jaccard distance
+require(gplots)           # For plotting heatmaps
+require(Heatplus)         # For plotting heatmaps with annotations
+require(reshape)          # For melting dataframe
+require(adegenet)         # For performing the Directed Minimum Spanning tree for clones
+require(igraph)           # For plotting of trees 
+require(knitr)            # For generating html docs
+```
+
+### Format of Input Data 
+The input matrix consists of mainly 1 for the mutation being present and 0 for absent. There is an additional required last column named "clusters". This can be started off with random assignments or by manual annotation of clones so as to enable comparison later on with the clonal clusters that the model based clustering method produce. Shown below is a subset of an example input matrix:
+
+```{r , results='asis', echo=FALSE}
+   pt3.cluster.dir <- "./pat_3_cluster_dat"
+   pt3_cluster     <- read.table(pt3.cluster.dir,header=TRUE)
+   kable(head(pt3_cluster[,c(1:6,50)]), format = "markdown")
+```
+
+### Running the Analysis - An Example 
+The R script with all the functions to analyse the data is contained in the R-script in the repository. Here parts of code are shown to demonstrate the workflow:
+
+```{r,echo=FALSE,cache=TRUE}
+#####################----
+# Declare Functions #
+#####################----
+
+# Create the dataframe for input----
+my_create_in_df <- function(pt1_cluster){
+  bin.mat <- as.matrix(pt1_cluster[,-which(colnames(pt1_cluster)=="clusters")])
+  test.df <- data.frame(Freq=as.integer(rep(1,dim(bin.mat)[1])))
+  test.df$Incidence <- bin.mat
+  return(test.df)
+}
+
+# Perform MDS on the binary data----
+my_MDS          <- function(pt1_cluster, pt1_fmm_best){
+  MDS_in      <- data.frame(apply(pt1_cluster[,-which(colnames(pt1_cluster)=="clusters")],2,function(x){factor(x)}))
+  res.mca     <- MCA(MDS_in, graph = FALSE)
+  MDS_vars_df <- data.frame(res.mca$var$coord)
+  MDS_inds_df <- data.frame(res.mca$ind$coord)
+  MDS_inds_df$cluster_assign <- factor(flexmix::clusters(pt1_fmm_best))
+  return(list(MDS_vars_df,MDS_inds_df))
+}
+
+# Perform the information criterion for cluster analysis----
+my_ic_fun       <- function(pt_fmm){
+  bic.df <- data.frame(nos_clus=seq(1:length(BIC(pt_fmm))),IC=BIC(pt_fmm))
+  aic.df <- data.frame(nos_clus=seq(1:length(AIC(pt_fmm))),IC=AIC(pt_fmm))
+  bic.df$measure <- rep("bic",dim(bic.df)[1])
+  aic.df$measure <- rep("aic",dim(aic.df)[1])
+  ic.df  <- rbind(bic.df,aic.df)
+  g <- ggplot(ic.df,aes(x=nos_clus,y=IC,group=measure,color=measure))+
+       geom_point(data=subset(ic.df,IC%in%c(min(bic.df$IC),min(aic.df$IC))),color="black",size=7.5,alpha=0.2)+
+       geom_point(size=3)+
+       geom_line(alpha=0.7)+
+       scale_colour_discrete(name  ="Measure",
+                            breaks=c("aic", "bic"),
+                            labels=c("Akaike", "Bayesian"))+
+       ggtitle("Number of Clones Selection Using Bayesian/Akaike Information Criterion")+
+       xlab("Number of clusters")+
+       ylab("Information Criterion")+
+       theme_bw()
+  g
+  return(g)
+}
+
+# Generate the parameters from the FMM model---- 
+my_params_df    <- function(pt_fmm_best , threshold=0.6){
+  pt_params      <- data.frame(parameters(pt_fmm_best))
+  pt_params$cat  <- (apply(pt_params,1,function(x){sum((x>threshold)+0)}))
+  pt_params$snps <- row.names(pt_params)
+  levels(pt_params$snps)  <- pt_params$snps[order(-pt_params$cat)]
+  pt_params_melt          <- melt.data.frame(pt_params,id=c("snps","cat"))
+  pt_params_melt$variable <- factor(gsub("Comp.","Clone ", pt_params_melt$variable))
+  pt_params_melt$cat[pt_params_melt$value<threshold] <- "Below Thres"
+  pt_params_melt$cat      <- as.factor(pt_params_melt$cat)
+  return(pt_params_melt)
+}
+
+# Generate the clonal consensus genotype from the FMM parameters
+my_param_2_cl   <- function(pt_fmm_best,bin_thres=0.65){
+  pt_cl_geno           <- data.frame (t(parameters(pt_fmm_best)))
+  pt_cl_geno[pt_cl_geno >= bin_thres] <- 1
+  pt_cl_geno[pt_cl_geno <  bin_thres] <- 0
+  rownames  (pt_cl_geno) <- gsub     ("Comp."   , "Clone_" ,rownames(pt_cl_geno))
+  colnames  (pt_cl_geno) <- gsub     ("center." , ""       ,colnames(pt_cl_geno))
+  return    (pt_cl_geno)
+}
+
+# Add primodial genotype as an additional clone
+my_add_pri      <- function(pt_cl_geno){
+  clone_0       <- (colSums(pt_cl_geno)==dim(pt_cl_geno)[1])+0
+  clone_out     <- rbind(clone_0,pt_cl_geno)
+  row.names(clone_out)[1] <- "clone_0"
+  return(clone_out)
+}
+
+# Generate the Clonal timepoints based on mutational frequency
+# clus_size     <- table     (flexmix::clusters(pt1_fmm_best))
+my_pre_tree     <- function(pt_cl_geno,clus_size,primary=TRUE){
+  mut_freq      <- apply     (pt_cl_geno,2,function(x){
+                   return((sum(clus_size*as.vector(x))/sum(clus_size)))})
+  log_cl_freq   <- apply     (pt_cl_geno,1,function(x){
+                   return(ceiling(-log10(prod(mut_freq[which(x==1)]))))})
+  clone_time    <- c(Sys.Date()+log_cl_freq)
+  
+  if(primary)   {pt_cl_geno           <- my_add_pri(pt_cl_geno)
+                 clone_time           <- c(Sys.Date(),Sys.Date()+log_cl_freq)
+                 names(clone_time)[1] <- "Clone_0"}
+  out           <- list(pt_cl_geno,clone_time)
+  return(out)
+}
+
+# Perform the tree generation algorithm
+my_run_tree     <- function(clone_gen_dis,clone_time){
+  clone_gen_dis <- as.matrix (vegdist(clone_gen_dis,method="jaccard"))
+  sqtk.res.add  <- seqTrack  (clone_gen_dis, 
+                              x.names = row.names(clone_gen_dis), 
+                              x.dates = clone_time)
+  g_pri         <- plot(sqtk.res.add,vertex.size=4)
+  return(list(g_pri,sqtk.res.add))
+}
+
+# Tree plotting layout function ----
+my_layout<-function(g_pri,root_in=1){
+  layout.mat  <- layout.reingold.tilford(g_pri,root=root_in)     # Get the layout matrix using the general reingold method
+  scaling_fac <- E(g_pri)$weight/E(g_pri)$weight[1] # Generate the scaling factor for each of the factor
+  layout.el   <- get.edgelist(g_pri)                # Get the edge list matrix
+  edges_tot   <- length(layout.el[,1])              # Get the total number of edges
+  for (i in seq(1,edges_tot)){
+    message(paste0("Scaling for edge: ",i))
+    xy_parent_node  <- layout.mat[as.numeric(layout.el[i,1]),]
+    xy_daught_node  <- layout.mat[as.numeric(layout.el[i,2]),]
+    update_x        <- xy_daught_node[1]
+    update_y        <- xy_parent_node[2]-scaling_fac[i]
+    layout.mat[as.numeric(layout.el[i,2]),1] <- update_x
+    layout.mat[as.numeric(layout.el[i,2]),2] <- update_y
+  }
+  return(layout.mat)
+}
+
+# Generate the heatmaps----
+# Returns: Heatmap[[1]] -> EM clustering heatmap
+# Returns: Heatmap[[2]] -> EM contrast with hclust
+# Returns: vector       -> hclust results
+# ---------------------
+my_heatmap      <- function(pt_cluster , pt_fmm_best , nos_clust,nos_mut){
+  bin.mat      <- as.matrix(pt_cluster[,-which(colnames(pt_cluster)=="clusters")])
+  EM_cluster   <- factor(flexmix::clusters           (pt_fmm_best))
+  nos_cluster  <- max   (as.numeric(flexmix::clusters(pt_fmm_best)))
+  row_order    <- order (as.numeric(flexmix::clusters(pt_fmm_best)))
+  data.dist    <- vegdist  (bin.mat     , method = "jaccard")
+  data.dist.g  <- vegdist  (t(bin.mat)  , method = "jaccard")
+  row.clus     <- hclust   (data.dist   , "ward.D2")
+  col.clus     <- hclust   (data.dist.g , "ward.D2")
+  hclust_ass   <- cutree   (row.clus    , nos_clust)
+  color_scheme <- colorRampPalette(c("white", "#660000"), space = "rgb")(2)
+  p            <- annHeatmap2(bin.mat[row_order,],
+                  scale  = "none", 
+                  col    = color_scheme, breaks = 2,
+                  legend = 3,
+                  dendrogram = list(Col = list(dendro = as.dendrogram(col.clus)),
+                                    Row = list(status = "no"                   ) ),
+                  cluster    = list(Col = list(cuth   = col.clus$height[length(col.clus$height)-nos_mut+1]     ),
+                                    Row = list(grp    = EM_cluster[row_order],
+                                               col    = brewer.pal(nos_cluster,"Set2")[seq(1,nos_cluster,by=1)]) ),
+                  ann        = list(Row = list(data   = data.frame(EM_cluster=EM_cluster[row_order])))
+                  )
+  p_row        <- annHeatmap2(bin.mat,
+                  scale  = "none", 
+                  col    = color_scheme, breaks = 2,
+                  legend = 3,
+                  dendrogram = list(Col = list(dendro = as.dendrogram(col.clus)),
+                                    Row = list(dendro = as.dendrogram(row.clus)) ),
+                  cluster    = list(Col = list(cuth   = col.clus$height[length(col.clus$height)-nos_mut+1]    ),
+                                    Row = list(cuth   = row.clus$height[length(row.clus$height)-nos_clust+1]) ),
+                  ann        = list(Row = list(data   = data.frame(EM_cluster=EM_cluster)))
+                  )
+   return(list(p,p_row,hclust_ass))
+}
+
+# Generates P.values of mutations in each clone given estimated Allele dropout Rate ------
+# --------------------
+my_pvalue_mut   <- function(pt_cluster , pt_fmm_best, ADO){
+  bin.df        <- pt_cluster[,-which(colnames(pt_cluster)=="clusters")]
+  pvalue.df     <- do.call("rbind", as.list(
+                   by(bin.df, list(clusters=paste0("Clone_",flexmix::clusters(pt_fmm_best))),
+                      function (x){
+                         clu_size <- dim(x)[1]
+                         p.value  <- apply(x,2,function(y){
+                         return((binom.test(sum(y), clu_size, p=1-ADO, alternative = "greater"))$p.value)})
+                      return   (p.value)}
+                   )))
+  return(pvalue.df)
+}
+
+# Generates P.values of mutations between clone ------
+# --------------------
+my_pvalue_clone <- function(pt_cluster , pt_fmm_best){
+  bin.df        <- pt_cluster[,-which (colnames(pt_cluster)=="clusters")]
+  bin.df$clus   <- factor    (flexmix::clusters(pt_fmm_best))
+  nos_clus      <- length    (levels  (bin.df$clus))
+  output.list   <- list()
+  output.vec    <- vector    ()
+  for(i in levels(bin.df$clus)){
+     for(j in levels(bin.df$clus)){
+        clus_df1      <- subset    (bin.df  ,clus==i)
+        clus_df2      <- subset    (bin.df  ,clus==j)
+        clus_df1_cs   <- colSums   (clus_df1  [,-which(colnames(clus_df1)=="clus")])
+        clus_df2_cs   <- colSums   (clus_df2  [,-which(colnames(clus_df2)=="clus")])
+        clus_df1.size <- dim       (clus_df1) [1]
+        clus_df2.size <- dim       (clus_df2) [1]
+        clus_prop.df  <- as.matrix (cbind (clus_df1_cs   , clus_df2_cs  ))
+        clus_in.df    <- clus_prop.df [clus_prop.df[,1] > 0 & 
+                                       clus_prop.df[,2] > 0 ,]
+        prob          <- rep       (clus_df1.size/(clus_df1.size + clus_df2.size),
+                                    dim(clus_in.df)[1])
+        test.out      <- prop.test (clus_in.df, 
+                                    alternative = "two.sided",
+                                    p           = prob , 
+                                    conf.level  = 0.95 ,
+                                    correct     = TRUE)
+        output.vec    <- rbind     (output.vec,test.out$p.value)
+     }
+  }
+  output        <- matrix(output.vec , nrow = nos_clus)
+  return(output)
+}
+
+# Generates P.values of clone specifying mutations -----
+# -----
+my_pvalue_cl_mu <- function(pt_cluster , pt_fmm_best){
+  bin.df        <- pt_cluster[,-which (colnames(pt_cluster)=="clusters")]
+  bin.df$clus   <- factor    (flexmix::clusters(pt_fmm_best))
+  nos_clus      <- length    (levels  (bin.df$clus))
+  output.vec    <- vector    ()
+  for(i in levels(bin.df$clus)){
+    for(j in levels(bin.df$clus)){
+      clus_df1      <- subset    (bin.df  ,clus==i)
+      clus_df2      <- subset    (bin.df  ,clus==j)
+      clus_df1_cs   <- colSums   (clus_df1  [,-which(colnames(clus_df1)=="clus")])
+      clus_df2_cs   <- colSums   (clus_df2  [,-which(colnames(clus_df2)=="clus")])
+      clus_df1.size <- dim       (clus_df1) [1]
+      clus_df2.size <- dim       (clus_df2) [1]
+      clus_prop.df  <- as.matrix (cbind (clus_df1_cs   , clus_df2_cs  ))
+      clus_in.df    <- clus_prop.df [clus_prop.df[,1] > 0 & 
+                                     clus_prop.df[,2] > 0 ,]
+      prob          <- rep       (clus_df1.size/(clus_df1.size + clus_df2.size),
+                                  dim(clus_in.df)[1])
+      test.out      <- prop.test (clus_in.df, 
+                                  alternative = "two.sided",
+                                  p           = prob , 
+                                  conf.level  = 0.95 ,
+                                  correct     = TRUE)
+      output.vec    <- rbind     (output.vec,test.out$p.value)
+    }
+  }
+  output        <- matrix(output.vec , nrow = nos_clus)
+  return(output)
+}
+
+# Generates a random MONOCLONAL cell dataset -----
+# -----
+my_rand_mon_bin <- function(nos_cell=20, nos_mut=10, ADO=0.3) {
+  random.vec    <- vector()
+  counter_mut   <- 0
+  repeat{
+    per_mut     <- rbinom(nos_cell,1,1-ADO)
+    random.vec  <- c(random.vec,per_mut)
+    counter_mut <- counter_mut + 1
+    if(counter_mut == nos_mut){break}
+  }
+  out.df           <- data.frame(matrix(random.vec,nrow=nos_cell))
+  colnames(out.df) <- paste0("mut_",seq(1,nos_mut,by=1))
+  out.df$clusters  <- as.integer(rep(1,nos_cell))
+  return(out.df)
+}
+
+# Generates a random clonal Genotype -----
+# -----
+my_rand_clo_bin <- function(nos_clone=4, nos_mut=10 ,prob=0.5) {
+  random.vec    <- vector()
+  counter_mut   <- 0
+  repeat{
+    per_mut     <- rbinom(nos_clone,1,prob)
+    random.vec  <- c(random.vec,per_mut)
+    counter_mut <- counter_mut + 1
+    if(counter_mut == nos_mut){break}
+  }
+  out.df           <- data.frame(matrix(random.vec,nrow=nos_clone))
+  colnames(out.df) <- paste0("mut_",seq(1,nos_mut,by=1))
+  return(out.df)
+}
+
+# Generates random cell data from clonal genotype
+
+my_rand_clu     <- function(clonal_genotype,nos_cell_vec,ADO,noise){
+  out_all.df    <- NULL
+  for (i in seq(1,dim(clonal_genotype)[1],by=1)){
+      random.vec       <- vector()
+      for (j in seq(1,dim(clonal_genotype)[2],by=1)){
+          if(clonal_genotype[i,j]==1){
+            per_mut    <- rbinom(nos_cell_vec[i], 1 , 1-ADO)
+            random.vec <- c(random.vec,per_mut)
+          }else{
+            per_mut    <- rbinom(nos_cell_vec[i], 1 , noise)
+            random.vec <- c(random.vec,per_mut)
+          }
+      }
+      out.df           <- data.frame (matrix(random.vec,nrow=nos_cell_vec[i]))
+      colnames(out.df) <- paste0     ("mut_",seq(1,dim(clonal_genotype)[2],by=1))
+      out.df$clusters  <- as.integer (rep   (i,nos_cell_vec[i]))  
+      out_all.df       <- rbind      (out_all.df,out.df)
+  }
+  return(out_all.df)
+}
+
+
+# Generates sub clones for sub-ancestors
+my_sub_geno <- function(pt_cluster,nos_grp,grp_sel){
+  bin.mat         <- as.matrix(pt_cluster[,-which(colnames(pt_cluster)=="clusters")])
+  data.dist.g     <- vegdist  (t(bin.mat)  , method = "jaccard")
+  col.clus        <- hclust   (data.dist.g , "ward.D2")
+  groups          <- cutree(col.clus, k=nos_grp)
+  sub_geno        <- (groups %in% grp_sel)+0
+  names(sub_geno) <- names(groups)
+  return(sub_geno)
+}
+
+```
+
+We began with using the function to cast the input mutation matrix into a format that can be used with stepFlexmix function to perform the model based clustering. This function is performed for different number of clones define by k, below we ran it from 1 to 7 possible clones and at each step we repeat it 3 times till convergence. 
+
+```{r,echo=TRUE,warnings=FALSE,error=FALSE,message=FALSE,results='hide'}
+###Patient 3--------
+set.seed(10)
+pt3_mb_clus.df  <- my_create_in_df(pt3_cluster)              # Creates the input for EM
+pt3_fmm         <- stepFlexmix    (Incidence ~ 1,
+                                   weights = ~ Freq, 
+                                   data    = pt3_mb_clus.df,
+                                   model   = FLXMCmvbinary(truncated = TRUE ),
+                                   control = list         (minprior  = 0.005), 
+                                   k       = 1:7, 
+                                   nrep    = 3)              # Perform the model base clustering
+```
+
+Then to select for the optimal number of clones that best describe the data, we use the information criterion (AIC and BIC) plots 
+
+```{r ggplot2ex,fig.align='center'}
+pt3_ic_plot     <- my_ic_fun      (pt3_fmm)                  # Generate Plots using Information Criterion
+pt3_ic_plot                                                  # Do the actual plot
+```
+
+From the plot we select the number of clones that best describe the data and subsequently generate the clonal profiles
+
+```{r}
+nos_clones      <- 5                                         # Select the required number of clones from criterion plots
+pt3_fmm_best    <- getModel       (pt3_fmm, nos_clones)      # Select the number of clones from diagnostic plots
+pt3_params_melt <- my_params_df   (pt3_fmm_best)             # Get the Parameters of Best Model
+pt3_pos.df      <- posterior      (pt3_fmm_best)             # Get the posterior probability for each cell
+nos_row_hc      <- 5                                         # Number of hclust row clusters 
+nos_mut         <- 5                                         # Number of mutations categories
+pt3_heatmaps    <- my_heatmap     (pt3_cluster,pt3_fmm_best,
+                                   nos_row_hc,nos_mut)       # Performs the heatmaps + jaccard dist clustering
+
+```
+
+Now, using the best model that describes the data. We use the heatmaps of the binary matrix to visualize the output of the model-based clustering
+
+```{r,fig.align='center'}
+plot(pt3_heatmaps[[1]])
+```
+
+To visualize the EM clustering in a different space, we plotted the single cell mutational data in Multiple Correspondance Analysis MCA space. In this space, each point represents a single cell and the color of the points corresponds to the different clones inferred from the model base clustering.
+
+```{r,fig.align='center'}
+pt3_MDS      <- my_MDS         (pt3_cluster,pt3_fmm_best) # Perform MCA on the binary data
+pt3_gg_MCA_1 <- ggplot(data = pt3_MDS[[2]], aes(x = Dim.1, y = Dim.2, label = rownames(pt3_MDS[[2]]))) + 
+  geom_hline    (yintercept = 0, colour = "gray70") + 
+  geom_vline    (xintercept = 0, colour = "gray70") +
+  geom_point    (aes(color  = factor(cluster_assign)), alpha = 0.7,size=4) +
+  geom_density2d(aes(color  = factor(cluster_assign)), alpha = 0.3) +
+  scale_colour_manual ( name   ="Clones", 
+                        values = brewer.pal(nos_clones, "Set2"),
+                        breaks = levels    (pt3_MDS[[2]]$cluster_assign),
+                        labels = paste0    ("clone ",levels(pt3_MDS[[2]]$cluster_assign)))+
+  ggtitle       ("MCA plot Single Cell Data With Finite Mixed Model Based Clustering") +
+  theme_bw()
+pt3_gg_MCA_1
+```
+
+At this stage, we are interested in what the are the mutations responsible for defining the clones and also visualize the consensus clonal profile.
+
+```{r,fig.align='center'}
+pt3_gg_clone_profile<-ggplot(pt3_params_melt,aes(x=snps,y=value,fill=cat))+
+  geom_bar          (stat="identity")+
+  geom_hline        (yintercept=0.6  , color="brown",linetype="dashed")+
+  facet_wrap        ( ~ variable     , ncol=1)+
+  ggtitle           ("Inferred Clone profile")+
+  scale_fill_manual (values = c(brewer.pal (length(levels(pt3_params_melt$cat))-1,"Set1"),"grey80"))+
+  theme(axis.text.x         = element_text (angle = 90, hjust = 1),
+        panel.background    = element_blank(),
+        axis.line           = element_line (colour = "black"))
+pt3_gg_clone_profile
+```
+
+Now we can estimate the Allele Dropout Rate (ADO) from the different clonal profiles
+
+```{r,fig.align='center'}
+pt3_est_ado     <- median         (1-pt3_params_melt$value[  pt3_params_melt$value >  0.5 
+                                                           & pt3_params_melt$value <= 1  ])
+
+pt3_gg_ADO <- ggplot(subset(pt3_params_melt,value>0.5 & value <1),aes(x=1-value))+
+  geom_histogram(binwidth = 0.02)+
+  ggtitle       ("Inferred Experimental Dropout Rate")+
+  xlab          ("Allele Dropout Rate") +
+  theme(axis.text.x       = element_text (angle  = 90, hjust = 1),
+        panel.background  = element_blank(),
+        axis.line         = element_line (colour = "black"))
+
+pt3_gg_ADO
+```
+
+We can then proceed to infer the relationship between the clones. 
+
+```{r,results='hide',fig.keep='none'}
+pt3_cl_geno   <- my_param_2_cl (pt3_fmm_best)
+pt3_cl_sel    <- c(1,2,3,4,5)
+pt3_pre_tree  <- my_pre_tree   (pt3_cl_geno[pt3_cl_sel,],
+                                table(flexmix::clusters(pt3_fmm_best))[pt3_cl_sel],
+                                primary=TRUE)
+pt3_tree      <- my_run_tree   (pt3_pre_tree[[1]],
+                                pt3_pre_tree[[2]])
+```
+
+Here we exploited the fact that clones with larger number of mutations younger and that they are derive from clones which are older that have less mutations. The height of the tree thus being with an ancestral clone, and based on the mutations that defines each of the consensus clone, we can draw the tree of relationship where the height of the tree can be interpreted to be the age of the clone from oldest ancestor at the top to the most recent clone at the bottom. The numbers of the edges of the trees reflects the jaccard distance between clones. 
+
+```{r,fig.align='center',results='hide',warning=FALSE,error=FALSE,message=FALSE}
+plot(pt3_tree[[1]],
+     layout          = my_layout(pt3_tree[[1]], root=1),
+     vertex.size     = c(1,as.vector(table(flexmix::clusters(pt3_fmm_best)))[pt3_cl_sel])*0.75,
+     vertex.label    = rownames(pt3_tree[[2]]),
+     vertex.color    = c("grey30",brewer.pal(length(rownames(pt3_cl_geno)),"Set2")[pt3_cl_sel]),
+     edge.arrow.size = 0.3,
+     edge.color      = "black")
+
+```
+
+#### Authors
+* Winston Koh  , Quake Lab, Department of Bioengineering, Stanford University
+* Charles Gawad, Division of Pediatric Hematology-Oncology, Department of Pediatrics, Stanford University
+* [Stephen Quake](http://thebigone.stanford.edu/)
+
