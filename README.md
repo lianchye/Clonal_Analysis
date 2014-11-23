@@ -12,6 +12,9 @@ The aim of this git repository is to provide an overview of the analysis publish
 * Multiple Correspondence analysis as an unsupervised method of infering clones from binary mutations matrix using `FactoMineR` package
 * Generation of clonal tree using the `adegenet` and `igraph` package
 
+### Code for functions
+The functions used in the below examples can be found in the model_based_clustering.R file. Example data are also provide as _dat files.
+
 ### Required R packages for the analysis
 
 ```r
